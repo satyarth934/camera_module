@@ -5,6 +5,7 @@ REST-based node that interfaces with MADSci and provides a USB camera interface
 import tempfile
 from pathlib import Path
 from typing import Annotated, Optional, Union
+from datetime import datetime
 
 import cv2
 from madsci.common.ownership import get_current_ownership_info
@@ -18,7 +19,7 @@ from pyzbar.pyzbar import decode
 class CameraNodeConfig(RestNodeConfig):
     """Configuration for the camera node module."""
 
-    camera_address: Union[int, str] = 0
+    camera_address: int = 0
     """The camera address, either a number for windows or a device path in Linux/Mac."""
 
 
@@ -99,13 +100,13 @@ class CameraNode(RestNode):
 
         success, frame = self.camera.read()
         if not success:
-            if self.camera.isOpened():
-                self.camera.release()
+            # if self.camera.isOpened():
+            #     self.camera.release()
             raise Exception("Unable to read from camera")
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
             temp_file_path = Path(temp_file.name)
             cv2.imwrite(str(temp_file_path), frame)
-        self.camera.release()
+        # self.camera.release()
 
         return temp_file_path
 
@@ -150,6 +151,113 @@ class CameraNode(RestNode):
             raise e
 
         return barcode, image_path
+
+    @action
+    def take_picture_with_timestamp(
+        self, focus: Optional[int] = None, autofocus: Optional[bool] = None
+    ) -> Annotated[Path, "The picture taken with a timestamp"]:
+        """Take a picture and write a timestamp at the bottom-left corner.
+
+        Returns:
+            Path: Path to the newly saved timestamped image.
+        """
+        # Reuse existing take_picture to capture raw frame
+        image_path = self.take_picture(focus=focus, autofocus=autofocus)
+
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise Exception("Failed to read image for timestamping")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.6, image.shape[1] / 2000.0 * 0.6)
+        thickness = 2
+
+        # position near bottom-left with small margin
+        text_size, _ = cv2.getTextSize(timestamp, font, scale, thickness)
+        x = 10
+        y = image.shape[0] - 10
+
+        # Draw semi-opaque background rectangle for readability
+        rect_tl = (x - 6, y - text_size[1] - 6)
+        rect_br = (x + text_size[0] + 6, y + 6)
+        cv2.rectangle(image, rect_tl, rect_br, (0, 0, 0), cv2.FILLED)
+
+        # Put white timestamp text
+        cv2.putText(image, timestamp, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_file_path = Path(temp_file.name)
+            cv2.imwrite(str(temp_file_path), image)
+
+        return temp_file_path
+
+    @action
+    def capture_read_and_process(
+        self, focus: Optional[int] = None, autofocus: Optional[bool] = None
+    ) -> Annotated[Path, "Processed image (YAY!!! overlay or grayscaled original)"]:
+        """Performs a sequence:
+
+        1. take picture with timestamp
+        2. read barcode
+        3. if a qr is detected successfully:
+           - take a new picture with timestamp
+           - write "YAY!!!" on top of the image in bold red and return it
+        4. else:
+           - grayscale the originally taken timestamped picture and return that
+        """
+        print("><><><>>>> inside capture_read_and_process!!")
+        # 1. take original timestamped picture
+        original_path = self.take_picture_with_timestamp(focus=focus, autofocus=autofocus)
+
+        # 2. read barcode (this will take a fresh picture internally in read_barcode)
+        barcode, _ = self.read_barcode(focus=focus, autofocus=autofocus)
+        print("><><><>>>> just read bardcode!!")
+        print(f"><><><>>>> {barcode = }")
+
+        if barcode is not None:
+            # 3.1 take a new picture with timestamp
+            new_path = self.take_picture_with_timestamp(focus=focus, autofocus=autofocus)
+            img = cv2.imread(str(new_path))
+            if img is None:
+                raise Exception("Failed to read newly captured image to write YAY!!!")
+
+            # 3.2 write "YAY!!!" on top of the image in bold red
+            text = "YAY!!!"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # scale font relative to image width
+            scale = max(1.0, img.shape[1] / 800.0)
+            thickness = max(2, int(round(scale)))
+
+            text_size, _ = cv2.getTextSize(text, font, scale, thickness)
+            x = int((img.shape[1] - text_size[0]) / 2)
+            y = 10 + text_size[1]
+
+            # draw black outline for readability then red text
+            cv2.putText(img, text, (x, y), font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(img, text, (x, y), font, scale, (0, 0, 255), thickness, cv2.LINE_AA)
+
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+                temp_file_path = Path(temp_file.name)
+                cv2.imwrite(str(temp_file_path), img)
+
+        else:
+            barcode = "--- QR NOT DETECTED ---"
+            # 4.1 grayscale the originally taken timestamped picture and return that
+            orig_img = cv2.imread(str(original_path))
+            if orig_img is None:
+                raise Exception("Failed to read original image to grayscale")
+
+            gray = cv2.cvtColor(orig_img, cv2.COLOR_BGR2GRAY)
+
+            # Save gray image
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+                temp_file_path = Path(temp_file.name)
+                cv2.imwrite(str(temp_file_path), gray)
+
+        return barcode, temp_file_path
+
 
     def adjust_focus_settings(
         self,
